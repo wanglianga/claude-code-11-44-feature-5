@@ -84,6 +84,24 @@ class Client:
     def get(self, path: str):
         return self._req("GET", path)
 
+    # ---- 分区覆盖 ----
+    def coverage_demo(self):
+        return self._req("POST", "/api/coverage/demo")
+
+    def coverage_import(self, bundle: dict):
+        return self._req("POST", "/api/coverage/import", bundle)
+
+    def coverage_run(self, vehicle_id: str, window_start: str, window_end: str,
+                     cargo_batch_id: str | None = None):
+        return self._req("POST", "/api/coverage/runs",
+                         {"vehicle_id": vehicle_id, "cargo_batch_id": cargo_batch_id,
+                          "window_start": window_start, "window_end": window_end})
+
+    def coverage_withdraw_group(self, group: str, withdrawn_from: str, reason: str = ""):
+        return self._req("POST", "/api/coverage/validations/withdraw-group",
+                         {"condition_group": group, "withdrawn_from": withdrawn_from,
+                          "reason": reason})
+
 
 # ---------------------------------------------------------------- 场景
 

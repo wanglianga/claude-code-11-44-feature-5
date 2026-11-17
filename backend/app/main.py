@@ -14,11 +14,18 @@ from sqlalchemy.orm import Session
 
 from .config import PURPOSES
 from .db import Base, engine, get_db
+from . import coverage as COV
+from .coverage_demo import run_demo as coverage_run_demo
 from .models import (
     ClockAnchor, ConnectionState, Consumer, ConsumptionRecord, CurrentReading,
     DeviceRelation, Frame, ParsedMessage, ProtocolContract, Publication,
     RawEnvelope, ReadingVersion, Sample, SampleConflict, StandardRun,
     TransportBatch,
+)
+from .models import (
+    BatchSpec, CoverageCell, CoverageCorrection, CoverageExport,
+    CoverageImportConflict, CoverageRun, PalletPlacement, PartitionEvent,
+    ProbeInstallation, VehicleLayout, ZoneValidation,
 )
 from .pipeline import (
     bump_counter, close_connection, get_counter, ingest_binary_chunk, ingest_json,
@@ -598,3 +605,347 @@ def _consumer_dict(db: Session, c: Consumer) -> dict:
     return {"id": c.id, "name": c.name, "purpose": c.purpose,
             "cursor_version": c.cursor_version, "cursor_seq": c.cursor_seq,
             "pending_page": c.pending_page, "acked_pages": records}
+
+
+# ---------------------------------------------------------------- 分区覆盖
+
+@app.post("/api/coverage/import")
+def coverage_import(bundle: dict = Body(...), db: Session = Depends(get_db)):
+    """导入覆盖输入（布局/清单/隔板/探头/验证/批次规格）。幂等：
+    同键同载荷去重，同键不同载荷记冲突保留原值，不复制货物空间。"""
+    try:
+        return COV.import_bundle(db, bundle)
+    except COV.CoverageError as e:
+        raise HTTPException(400, str(e))
+    except KeyError as e:
+        raise HTTPException(400, f"缺少字段：{e}")
+
+
+@app.post("/api/coverage/demo")
+def coverage_demo(db: Session = Depends(get_db)):
+    """一键演示：补演示读数 → 导入演示输入 → 对演示窗口执行覆盖分析。"""
+    try:
+        return coverage_run_demo(db)
+    except COV.CoverageError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/coverage/inputs")
+def coverage_inputs(vehicle_id: str, db: Session = Depends(get_db)):
+    """车辆当前覆盖输入：布局、清单、隔板、探头安装、验证资料、批次规格。"""
+    layout = COV.current_layout(db, vehicle_id)
+    layouts = (db.query(VehicleLayout).filter_by(vehicle_id=vehicle_id)
+               .order_by(VehicleLayout.revision).all())
+    placements = (db.query(PalletPlacement).filter_by(vehicle_id=vehicle_id)
+                  .order_by(PalletPlacement.pallet_id, PalletPlacement.version).all())
+    partitions = (db.query(PartitionEvent).filter_by(vehicle_id=vehicle_id)
+                  .order_by(PartitionEvent.effective_from).all())
+    probes = (db.query(ProbeInstallation).filter_by(vehicle_id=vehicle_id)
+              .order_by(ProbeInstallation.installed_from).all())
+    vals = (db.query(ZoneValidation).filter_by(vehicle_id=vehicle_id)
+            .order_by(ZoneValidation.validation_key, ZoneValidation.revision).all())
+    specs = db.query(BatchSpec).order_by(BatchSpec.cargo_batch_id).all()
+    return {
+        "vehicle_id": vehicle_id,
+        "current_layout_revision": layout.revision if layout else None,
+        "layouts": [{"revision": l.revision, "status": l.status, "coord": l.coord,
+                     "length_m": l.length_m, "width_m": l.width_m, "layers": l.layers,
+                     "zones": l.zones, "note": l.note} for l in layouts],
+        "placements": [{"placement_key": p.placement_key, "version": p.version,
+                        "manifest_id": p.manifest_id, "pallet_id": p.pallet_id,
+                        "batches": p.batches, "rect": p.rect, "layer": p.layer,
+                        "from_lo": _iso(p.from_lo), "from_hi": _iso(p.from_hi),
+                        "to_lo": _iso(p.to_lo), "to_hi": _iso(p.to_hi),
+                        "corrected_by": p.corrected_by} for p in placements],
+        "partitions": [{"event_key": e.event_key, "partition_id": e.partition_id,
+                        "x_position": e.x_position,
+                        "effective_from": _iso(e.effective_from),
+                        "effective_to": _iso(e.effective_to)} for e in partitions],
+        "probes": [{"install_key": i.install_key, "probe_id": i.probe_id,
+                    "x": i.x, "y": i.y, "layer": i.layer,
+                    "installed_from": _iso(i.installed_from),
+                    "installed_to": _iso(i.installed_to)} for i in probes],
+        "validations": [{"validation_key": v.validation_key, "revision": v.revision,
+                         "probe_id": v.probe_id, "structure": v.structure,
+                         "install_point": v.install_point,
+                         "install_condition": v.install_condition,
+                         "range_rect": v.range_rect, "range_layer": v.range_layer,
+                         "partition_config": v.partition_config,
+                         "condition_group": v.condition_group,
+                         "valid_from": _iso(v.valid_from), "valid_to": _iso(v.valid_to),
+                         "status": v.status,
+                         "withdrawn_from": _iso(v.withdrawn_from),
+                         "withdraw_reason": v.withdraw_reason} for v in vals],
+        "batch_specs": [{"cargo_batch_id": s.cargo_batch_id, "temp_min_c": s.temp_min_c,
+                         "temp_max_c": s.temp_max_c, "window_minutes": s.window_minutes,
+                         "min_readings": s.min_readings} for s in specs],
+        "revisions": COV.input_revisions(db),
+    }
+
+
+class CoverageRunIn(BaseModel):
+    vehicle_id: str
+    cargo_batch_id: str | None = None
+    window_start: datetime
+    window_end: datetime
+
+
+@app.post("/api/coverage/runs")
+def coverage_run_create(body: CoverageRunIn, db: Session = Depends(get_db)):
+    """执行一次覆盖分析（精确空间切分）。计算期间输入变化则标记 stale_inputs。"""
+    try:
+        run = COV.run_coverage(db, body.vehicle_id, body.cargo_batch_id,
+                               body.window_start, body.window_end)
+    except COV.CoverageError as e:
+        raise HTTPException(400, str(e))
+    return {"run_id": run.id, "status": run.status, "note": run.note,
+            "stats": run.stats}
+
+
+@app.get("/api/coverage/runs")
+def coverage_runs(vehicle_id: str | None = None, db: Session = Depends(get_db)):
+    q = db.query(CoverageRun)
+    if vehicle_id:
+        q = q.filter_by(vehicle_id=vehicle_id)
+    runs = q.order_by(CoverageRun.id.desc()).limit(100).all()
+    return {"runs": [{**COV.run_dict(db, r), "stats": None} for r in runs]}
+
+
+@app.get("/api/coverage/runs/{run_id}")
+def coverage_run_detail(run_id: int, db: Session = Depends(get_db)):
+    run = db.get(CoverageRun, run_id)
+    if not run:
+        raise HTTPException(404, "运行不存在")
+    layout = (db.query(VehicleLayout)
+              .filter_by(vehicle_id=run.vehicle_id)
+              .filter(VehicleLayout.revision == (run.used or {}).get("layout_revision", -1))
+              .first())
+    placements = (db.query(PalletPlacement).filter_by(vehicle_id=run.vehicle_id)
+                  .order_by(PalletPlacement.pallet_id, PalletPlacement.version).all())
+    partitions = (db.query(PartitionEvent).filter_by(vehicle_id=run.vehicle_id)
+                  .order_by(PartitionEvent.effective_from).all())
+    probes = (db.query(ProbeInstallation).filter_by(vehicle_id=run.vehicle_id).all())
+    vals = (db.query(ZoneValidation).filter_by(vehicle_id=run.vehicle_id)
+            .order_by(ZoneValidation.validation_key, ZoneValidation.revision).all())
+    return {"run": COV.run_dict(db, run),
+            "layout": {"revision": layout.revision, "coord": layout.coord,
+                       "length_m": layout.length_m, "width_m": layout.width_m,
+                       "layers": layout.layers, "zones": layout.zones} if layout else None,
+            "placements": [{"placement_key": p.placement_key, "manifest_id": p.manifest_id,
+                            "pallet_id": p.pallet_id, "batches": p.batches, "rect": p.rect,
+                            "layer": p.layer, "from_lo": _iso(p.from_lo),
+                            "from_hi": _iso(p.from_hi), "to_lo": _iso(p.to_lo),
+                            "to_hi": _iso(p.to_hi), "corrected_by": p.corrected_by}
+                           for p in placements],
+            "partitions": [{"partition_id": e.partition_id, "x_position": e.x_position,
+                            "effective_from": _iso(e.effective_from),
+                            "effective_to": _iso(e.effective_to)} for e in partitions],
+            "probes": [{"probe_id": i.probe_id, "x": i.x, "y": i.y, "layer": i.layer,
+                        "installed_from": _iso(i.installed_from),
+                        "installed_to": _iso(i.installed_to)} for i in probes],
+            "validations": [{"validation_key": v.validation_key, "revision": v.revision,
+                             "probe_id": v.probe_id, "range_rect": v.range_rect,
+                             "range_layer": v.range_layer,
+                             "partition_config": v.partition_config,
+                             "condition_group": v.condition_group,
+                             "valid_from": _iso(v.valid_from), "valid_to": _iso(v.valid_to),
+                             "status": v.status, "withdrawn_from": _iso(v.withdrawn_from)}
+                            for v in vals]}
+
+
+@app.get("/api/coverage/runs/{run_id}/cells")
+def coverage_run_cells(run_id: int, cargo_batch_id: str | None = None,
+                       category: str | None = None,
+                       window_start: str | None = None,
+                       db: Session = Depends(get_db)):
+    if not db.get(CoverageRun, run_id):
+        raise HTTPException(404, "运行不存在")
+    q = db.query(CoverageCell).filter_by(run_id=run_id)
+    if cargo_batch_id:
+        q = q.filter_by(cargo_batch_id=cargo_batch_id)
+    if category:
+        q = q.filter_by(category=category)
+    if window_start:
+        q = q.filter(CoverageCell.window_start == COV._dt(window_start))
+    cells = q.order_by(CoverageCell.id).all()
+    return {"cells": [COV.cell_dict(c) for c in cells]}
+
+
+@app.get("/api/coverage/runs/{run_id}/unconfirmed")
+def coverage_run_unconfirmed(run_id: int, db: Session = Depends(get_db)):
+    """未确认原因查询：缺资格/缺读数/布局待核的空间与原因，含探头实际测量点。"""
+    if not db.get(CoverageRun, run_id):
+        raise HTTPException(404, "运行不存在")
+    return COV.unconfirmed_of_run(db, run_id)
+
+
+@app.get("/api/coverage/batch-summary")
+def coverage_batch_summary(vehicle_id: str, cargo_batch_id: str,
+                           db: Session = Depends(get_db)):
+    """批次查询：该批次最近一次当前运行的覆盖结果（批次查询使用覆盖结果）。"""
+    run = (db.query(CoverageRun)
+           .filter_by(vehicle_id=vehicle_id, status="current")
+           .order_by(CoverageRun.id.desc()).first())
+    if not run:
+        raise HTTPException(404, "该车没有当前覆盖分析，请先运行")
+    stats = (run.stats or {}).get("batches", {}).get(cargo_batch_id)
+    if not stats:
+        raise HTTPException(404, f"运行 {run.id} 中没有批次 {cargo_batch_id} 的覆盖结果")
+    return {"run_id": run.id, "run_status": run.status,
+            "inputs_stale": COV.run_dict(db, run)["inputs_stale"],
+            "vehicle_id": vehicle_id, "cargo_batch_id": cargo_batch_id,
+            "window_start": _iso(run.window_start), "window_end": _iso(run.window_end),
+            "coverage": stats}
+
+
+class ExportIn(BaseModel):
+    label: str = ""
+
+
+@app.post("/api/coverage/runs/{run_id}/export")
+def coverage_export_create(run_id: int, body: ExportIn | None = None,
+                           db: Session = Depends(get_db)):
+    try:
+        exp = COV.export_run(db, run_id, (body.label if body else ""))
+    except COV.CoverageError as e:
+        raise HTTPException(404, str(e))
+    return {"id": exp.id, "run_id": exp.run_id, "created_at": _iso(exp.created_at)}
+
+
+@app.get("/api/coverage/exports")
+def coverage_exports(db: Session = Depends(get_db)):
+    exps = db.query(CoverageExport).order_by(CoverageExport.id.desc()).all()
+    return {"exports": [COV.export_dict(db, e) for e in exps]}
+
+
+@app.get("/api/coverage/exports/{exp_id}")
+def coverage_export_detail(exp_id: int, db: Session = Depends(get_db)):
+    exp = db.get(CoverageExport, exp_id)
+    if not exp:
+        raise HTTPException(404, "导出不存在")
+    return COV.export_dict(db, exp, with_payload=True)
+
+
+class PlacementCorrectIn(BaseModel):
+    manifest_id: str
+    vehicle_id: str
+    pallet_id: str
+    batches: list
+    rect: dict
+    layer: str
+    from_lo: datetime
+    from_hi: datetime | None = None
+    to_lo: datetime | None = None
+    to_hi: datetime | None = None
+
+
+@app.post("/api/coverage/placements/{key}/correct")
+def coverage_placement_correct(key: str, body: PlacementCorrectIn,
+                               db: Session = Depends(get_db)):
+    """清单更正：新版本替换旧版本；返回按实际引用追到的货物与分析时段。"""
+    try:
+        new, impact = COV.correct_placement(db, key, body.model_dump())
+    except COV.CoverageError as e:
+        raise HTTPException(404, str(e))
+    return {"placement_key": key, "version": new.version, "impact": impact}
+
+
+@app.post("/api/coverage/validations/{key}/revise")
+def coverage_validation_revise(key: str, item: dict = Body(...),
+                               db: Session = Depends(get_db)):
+    try:
+        new, impact = COV.revise_validation(db, key, item)
+    except COV.CoverageError as e:
+        raise HTTPException(400, str(e))
+    return {"validation_key": key, "revision": new.revision, "impact": impact}
+
+
+class WithdrawIn(BaseModel):
+    withdrawn_from: datetime
+    reason: str = ""
+
+
+@app.post("/api/coverage/validations/{key}/withdraw")
+def coverage_validation_withdraw(key: str, body: WithdrawIn,
+                                 db: Session = Depends(get_db)):
+    try:
+        v, impact = COV.withdraw_validation(db, key, body.withdrawn_from, body.reason)
+    except COV.CoverageError as e:
+        raise HTTPException(400, str(e))
+    return {"validation_key": key, "status": v.status,
+            "withdrawn_from": _iso(v.withdrawn_from), "impact": impact}
+
+
+class WithdrawGroupIn(BaseModel):
+    condition_group: str
+    withdrawn_from: datetime
+    reason: str = ""
+
+
+@app.post("/api/coverage/validations/withdraw-group")
+def coverage_validation_withdraw_group(body: WithdrawGroupIn,
+                                       db: Session = Depends(get_db)):
+    """批量撤回：同一验证条件下的全部现行验证失效，波及多次运输。"""
+    try:
+        return COV.withdraw_group(db, body.condition_group, body.withdrawn_from,
+                                  body.reason)
+    except COV.CoverageError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/coverage/impact")
+def coverage_impact(kind: str, key: str = "", vehicle_id: str | None = None,
+                    effective_at: datetime | None = None,
+                    db: Session = Depends(get_db)):
+    """影响查询：按实际引用追到货物批次与分析时段（含补证获得资格的记录）。"""
+    if kind == "layout":
+        if not vehicle_id:
+            raise HTTPException(400, "layout 影响查询需要 vehicle_id")
+        lay = COV.current_layout(db, vehicle_id)
+        rev = lay.revision if lay else 0
+        out = COV.impact_of(db, "layout", vehicle_id, vehicle_id)
+        out["current_layout_revision"] = rev
+        out["affected_runs"] = [r for r in out["affected_runs"]]
+        # 只保留引用旧布局修订的运行
+        runs = []
+        for r in db.query(CoverageRun).filter_by(vehicle_id=vehicle_id).all():
+            if (r.used or {}).get("layout_revision", rev) < rev:
+                runs.append({"run_id": r.id, "status": r.status,
+                             "cargo_batch_id": r.cargo_batch_id,
+                             "window_start": _iso(r.window_start),
+                             "window_end": _iso(r.window_end),
+                             "layout_revision": (r.used or {}).get("layout_revision")})
+        out["affected_runs"] = runs
+        return out
+    if kind not in ("placement", "validation"):
+        raise HTTPException(400, "kind 必须是 layout | placement | validation")
+    return COV.impact_of(db, kind, key, vehicle_id, effective_at)
+
+
+@app.get("/api/coverage/compare")
+def coverage_compare(run_a: int, run_b: int, db: Session = Depends(get_db)):
+    """布局更正前后比较：分窗口类别面积时间对比 + 类别变化的分片。"""
+    try:
+        return COV.compare_runs(db, run_a, run_b)
+    except COV.CoverageError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/api/coverage/corrections")
+def coverage_corrections(vehicle_id: str | None = None, db: Session = Depends(get_db)):
+    q = db.query(CoverageCorrection)
+    if vehicle_id:
+        q = q.filter_by(vehicle_id=vehicle_id)
+    corrs = q.order_by(CoverageCorrection.id.desc()).limit(100).all()
+    return {"corrections": [{"id": c.id, "kind": c.kind, "vehicle_id": c.vehicle_id,
+                             "entity_key": c.entity_key,
+                             "effective_at": _iso(c.effective_at), "detail": c.detail,
+                             "created_at": _iso(c.created_at)} for c in corrs]}
+
+
+@app.get("/api/coverage/import-conflicts")
+def coverage_import_conflicts(db: Session = Depends(get_db)):
+    rows = db.query(CoverageImportConflict).order_by(CoverageImportConflict.id.desc()).limit(100).all()
+    return {"conflicts": [{"id": c.id, "entity": c.entity, "natural_key": c.natural_key,
+                           "incoming_payload": c.incoming_payload,
+                           "created_at": _iso(c.created_at)} for c in rows]}

@@ -7,6 +7,9 @@
   标准化层    parsed_message / sample / sample_conflict / reading_version / current_reading
   质量发布层  publication / publication_item / consumer / consumption_record
   运行控制    standard_run（标准化/重放运行，提交前校验）
+  分区覆盖层  vehicle_layout / pallet_placement / partition_event / probe_installation /
+              zone_validation / batch_spec / coverage_run / coverage_cell / coverage_export /
+              coverage_import_conflict
 """
 from sqlalchemy import (
     BigInteger, Boolean, Column, DateTime, Float, ForeignKey, Integer,
@@ -308,3 +311,236 @@ class ConsumptionRecord(Base):
     to_seq = Column(Integer, nullable=False)
     item_count = Column(Integer, nullable=False)
     acked_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# ---------------------------------------------------------------- 分区覆盖层
+#
+# 装载分区温度观测覆盖分析：输入为车厢布局（本地坐标/分区/货层）、托盘装载清单、
+# 隔板位置、探头安装位置、分区验证资料（虚构）与批次温控规格；覆盖计算读取这些
+# 记录与已有标准读数。所有矩形均为车厢本地坐标 {x, y, w, h}（米，轴对齐）。
+
+class VehicleLayout(Base):
+    """车厢布局版本：本地坐标系（原点/方向/单位）、厢体尺寸、货层与分区。
+
+    布局更正产生新修订（revision+1），旧修订保留可溯；覆盖分析按 revision 引用。
+    """
+    __tablename__ = "vehicle_layout"
+    __table_args__ = (UniqueConstraint("vehicle_id", "revision", name="uq_layout_vehicle_rev"),)
+
+    id = Column(Integer, primary_key=True)
+    vehicle_id = Column(String(64), nullable=False)
+    revision = Column(Integer, nullable=False)
+    coord = Column(JSONB, nullable=False)       # {origin, x_axis, y_axis, unit}
+    length_m = Column(Float, nullable=False)    # x 轴长度（米）
+    width_m = Column(Float, nullable=False)     # y 轴宽度（米）
+    layers = Column(JSONB, nullable=False)      # 货层列表，如 ["L1"]；不同货层空间隔离
+    zones = Column(JSONB, nullable=False)       # [{zone_id, name, rect, layer}] 车厢分区
+    status = Column(String(16), nullable=False, default="current")  # current | superseded
+    note = Column(String(256), default="")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class PalletPlacement(Base):
+    """托盘装载清单记录：某托盘在 [from,to) 占用某矩形区域（某货层）。
+
+    中途移动 = 旧记录结束 + 新记录开始；时刻不确定时用 [lo,hi] 范围表示
+    （lo==hi 为精确时刻）。更正产生新版本（corrected_by 链接），旧版本保留。
+    一个托盘可含多个批次（batches 数组）；没有批内可验证分区时只按托盘共同覆盖。
+    """
+    __tablename__ = "pallet_placement"
+    __table_args__ = (UniqueConstraint("placement_key", "version", name="uq_placement_key_ver"),)
+
+    id = Column(Integer, primary_key=True)
+    placement_key = Column(String(64), nullable=False)    # 客户端自然键（幂等）
+    manifest_id = Column(String(64), nullable=False)      # 装载清单号
+    vehicle_id = Column(String(64), nullable=False)
+    pallet_id = Column(String(64), nullable=False)
+    batches = Column(JSONB, nullable=False)               # [{"batch_id","pieces"}]
+    rect = Column(JSONB, nullable=False)                  # {x,y,w,h}
+    layer = Column(String(32), nullable=False)
+    from_lo = Column(DateTime(timezone=True), nullable=False)   # 生效时刻下界
+    from_hi = Column(DateTime(timezone=True), nullable=False)   # 生效时刻上界（==from_lo 精确）
+    to_lo = Column(DateTime(timezone=True))                     # 结束时刻下界（NULL=持续）
+    to_hi = Column(DateTime(timezone=True))                     # 结束时刻上界
+    payload_hash = Column(String(64), nullable=False)
+    version = Column(Integer, nullable=False, default=1)
+    corrected_by = Column(Integer, nullable=True)         # 更正版本 id（NULL=当前有效）
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class PartitionEvent(Base):
+    """隔板位置事件：隔板在有效区间内处于 x_position（沿 x 轴贯通全宽的竖隔板）。
+
+    隔板把车厢分成若干封闭分区（enclosure），不同封闭分区的验证范围不能混用。
+    """
+    __tablename__ = "partition_event"
+
+    id = Column(Integer, primary_key=True)
+    event_key = Column(String(64), nullable=False, unique=True)   # 幂等键
+    vehicle_id = Column(String(64), nullable=False)
+    partition_id = Column(String(64), nullable=False)
+    x_position = Column(Float, nullable=False)
+    effective_from = Column(DateTime(timezone=True), nullable=False)
+    effective_to = Column(DateTime(timezone=True))                # NULL=至今
+    payload_hash = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ProbeInstallation(Base):
+    """探头安装位置：探头在车厢本地坐标下的安装点（含货层）与有效区间。"""
+    __tablename__ = "probe_installation"
+
+    id = Column(Integer, primary_key=True)
+    install_key = Column(String(64), nullable=False, unique=True)  # 幂等键
+    probe_id = Column(String(64), nullable=False)
+    vehicle_id = Column(String(64), nullable=False)
+    x = Column(Float, nullable=False)
+    y = Column(Float, nullable=False)
+    layer = Column(String(32), nullable=False)
+    installed_from = Column(DateTime(timezone=True), nullable=False)
+    installed_to = Column(DateTime(timezone=True))                 # NULL=至今
+    payload_hash = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class ZoneValidation(Base):
+    """分区验证资料（虚构）：某探头在指定车厢结构/隔板配置/安装条件下，
+    经验证可代表的矩形空间。按 (validation_key, revision) 版本化。
+
+    代表范围只来自本表记录，不由最近距离或温度稳定自行扩张；
+    撤回（withdrawn_from 起失效）可能波及同一验证条件下的多次运输。
+    """
+    __tablename__ = "zone_validation"
+    __table_args__ = (UniqueConstraint("validation_key", "revision", name="uq_validation_key_rev"),)
+
+    id = Column(Integer, primary_key=True)
+    validation_key = Column(String(64), nullable=False)
+    revision = Column(Integer, nullable=False)
+    vehicle_id = Column(String(64), nullable=False)      # 仅适用本车（同车型他车不能混用）
+    structure = Column(String(128), nullable=False)      # 适用车厢结构描述
+    probe_id = Column(String(64), nullable=False)
+    install_point = Column(JSONB, nullable=False)        # 验证时安装条件：{x,y,layer}
+    install_condition = Column(String(256), default="")  # 安装条件文字说明
+    range_rect = Column(JSONB, nullable=False)           # 已确认代表范围 {x,y,w,h}
+    range_layer = Column(String(32), nullable=False)
+    partition_config = Column(JSONB, nullable=False, default=list)  # 要求隔板配置 [{partition_id,x}]
+    condition_group = Column(String(64), nullable=False, default="")  # 同一验证条件（批量撤回用）
+    valid_from = Column(DateTime(timezone=True), nullable=False)
+    valid_to = Column(DateTime(timezone=True))           # NULL=至今
+    status = Column(String(16), nullable=False, default="active")   # active | superseded | withdrawn
+    withdrawn_from = Column(DateTime(timezone=True))     # 撤回生效时刻（>=该时刻无资格）
+    withdraw_reason = Column(String(256), default="")
+    payload_hash = Column(String(64), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class BatchSpec(Base):
+    """批次温控规格：温度上下限、统计时间窗、窗口内最少有效读数。"""
+    __tablename__ = "batch_spec"
+
+    cargo_batch_id = Column(String(64), primary_key=True)
+    temp_min_c = Column(Float, nullable=False)
+    temp_max_c = Column(Float, nullable=False)
+    window_minutes = Column(Integer, nullable=False, default=60)
+    min_readings = Column(Integer, nullable=False, default=1)  # 窗口内有效读数不足则记缺读数
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CoverageRun(Base):
+    """一次覆盖分析运行：范围（车辆/批次/时段）、方法、输入指纹与结果统计。
+
+    输入指纹（revisions + 实际引用的记录键）用于：
+      - 计算期间基础数据变化 → stale_inputs，不能直接替换当前分析；
+      - 影响查询按实际引用追到货物与分析时段；
+      - 导出保留依据，更正范围可查。
+    """
+    __tablename__ = "coverage_run"
+
+    id = Column(Integer, primary_key=True)
+    vehicle_id = Column(String(64), nullable=False)
+    cargo_batch_id = Column(String(64))                  # NULL=车上全部批次
+    window_start = Column(DateTime(timezone=True), nullable=False)
+    window_end = Column(DateTime(timezone=True), nullable=False)
+    method = Column(String(16), nullable=False, default="exact")  # exact=精确空间切分
+    revisions = Column(JSONB, nullable=False)            # 启动时各输入版本计数
+    used = Column(JSONB, nullable=False, default=dict)   # 实际引用：validation_keys/placement_keys/...
+    status = Column(String(16), nullable=False, default="current")  # current | stale_inputs | superseded
+    stats = Column(JSONB, nullable=False, default=dict)  # 分批次的窗口×类别面积时间统计
+    note = Column(String(256), default="")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    finished_at = Column(DateTime(timezone=True))
+
+
+class CoverageCell(Base):
+    """运行产出的最小均质分片：某统计窗口×布局区间内，类别一致的矩形空间。
+
+    category: supported | conflict | no_reading | no_qualification | layout_pending
+    类别互斥（面积不重复计量）；reasons 保留不能归入单一类别的重叠原因；
+    occupancy_conflict 的空间占用冲突单独标记，不纳入覆盖率分母。
+    """
+    __tablename__ = "coverage_cell"
+
+    id = Column(BigInteger, primary_key=True)
+    run_id = Column(Integer, ForeignKey("coverage_run.id"), nullable=False)
+    cargo_batch_id = Column(String(64), nullable=False)
+    pallet_id = Column(String(64), nullable=False)
+    layer = Column(String(32), nullable=False)
+    enclosure = Column(String(64), nullable=False)
+    window_start = Column(DateTime(timezone=True), nullable=False)   # 统计窗口
+    window_end = Column(DateTime(timezone=True), nullable=False)
+    interval_start = Column(DateTime(timezone=True), nullable=False) # 布局区间
+    interval_end = Column(DateTime(timezone=True), nullable=False)
+    x = Column(Float, nullable=False)
+    y = Column(Float, nullable=False)
+    w = Column(Float, nullable=False)
+    h = Column(Float, nullable=False)
+    category = Column(String(24), nullable=False)
+    reading_verdict = Column(String(16))                 # normal | exceed（supported 时）
+    reasons = Column(JSONB, nullable=False, default=list)
+    probes = Column(JSONB, nullable=False, default=list) # [{probe_id,verdict,readings,temps,validated}]
+    layout_variants = Column(JSONB)                      # layout_pending 时各可行布局的类别
+    occupancy_conflict = Column(Boolean, nullable=False, default=False)
+    conflict_with = Column(JSONB, nullable=False, default=list)  # 冲突的清单/托盘
+    mixed_pallet = Column(Boolean, nullable=False, default=False)  # 混批托盘：托盘共同覆盖
+
+
+class CoverageExport(Base):
+    """导出快照：某次运行结果的不可变副本 + 输入依据。更正后可查影响范围。"""
+    __tablename__ = "coverage_export"
+
+    id = Column(Integer, primary_key=True)
+    run_id = Column(Integer, ForeignKey("coverage_run.id"), nullable=False)
+    label = Column(String(128), default="")
+    payload = Column(JSONB, nullable=False)              # 完整结果快照（含输入指纹）
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CoverageImportConflict(Base):
+    """导入幂等冲突：同自然键不同载荷 → 保留原值，记录冲突（不覆盖、不复制空间）。"""
+    __tablename__ = "coverage_import_conflict"
+
+    id = Column(BigInteger, primary_key=True)
+    entity = Column(String(32), nullable=False)          # placement | partition | probe | validation | batch_spec
+    natural_key = Column(String(64), nullable=False)
+    existing_hash = Column(String(64), nullable=False)
+    incoming_hash = Column(String(64), nullable=False)
+    incoming_payload = Column(JSONB, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CoverageCorrection(Base):
+    """更正事件日志：布局修订、清单更正、验证修订/撤回等。
+
+    影响查询按运行的实际引用（run.used）追到货物与分析时段；
+    导出快照按 created_at 查"导出后的更正范围"。
+    """
+    __tablename__ = "coverage_correction"
+
+    id = Column(Integer, primary_key=True)
+    kind = Column(String(32), nullable=False)            # layout_revise | placement_correct |
+                                                         # validation_revise | validation_withdraw
+    vehicle_id = Column(String(64), nullable=False)
+    entity_key = Column(String(64), nullable=False)      # 布局车辆 / placement_key / validation_key
+    effective_at = Column(DateTime(timezone=True))       # 生效时刻（撤回/资格起点等）
+    detail = Column(JSONB, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
